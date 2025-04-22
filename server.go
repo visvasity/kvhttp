@@ -1,0 +1,667 @@
+// Copyright (c) 2024 Visvasity LLC
+
+package kvhttp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+
+	"github.com/google/uuid"
+
+	"github.com/visvasity/kv"
+	"github.com/visvasity/kvhttp/api"
+	"github.com/visvasity/syncmap"
+)
+
+type idLock struct {
+	id uuid.UUID
+	mu sync.Mutex
+}
+
+type iterData struct {
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+
+	err  error
+	iter iter.Seq2[string, io.Reader]
+
+	next func() (string, io.Reader, bool)
+	stop func()
+}
+
+func (itd *iterData) Close() {
+	itd.ctxCancel()
+	itd.stop()
+}
+
+type server[T kv.Transaction, S kv.Snapshot] struct {
+	db kv.Database[T, S]
+
+	mux *http.ServeMux
+
+	dbPath, txPath, itPath, snapPath string
+
+	// nameMap holds a mapping from client assigned name to an unique, lockable
+	// uuid. Clients refer to iterators, snapshots and txes by their names, which
+	// are assigned unique uuids on the server side.
+	nameMap syncmap.Map[string, *idLock]
+
+	txMap     syncmap.Map[uuid.UUID, kv.Transaction]
+	snapMap   syncmap.Map[uuid.UUID, kv.Snapshot]
+	itDataMap syncmap.Map[uuid.UUID, *iterData]
+
+	// txItersMap and snapItersMap hold slice of iterator names for a tx or
+	// snapshot. Multiple iterators can be live simultaneously for a single tx
+	// (or snapshot). Iterators are closed automatically when tx or snapshot is
+	// done.
+
+	txItersMap   syncmap.Map[uuid.UUID, []string]
+	snapItersMap syncmap.Map[uuid.UUID, []string]
+}
+
+func size[K comparable, V any](m *syncmap.Map[K, V]) int {
+	n := 0
+	for range m.Range {
+		n++
+	}
+	return n
+}
+
+func Handler[T kv.Transaction, S kv.Snapshot](db kv.Database[T, S]) http.Handler {
+	s := &server[T, S]{
+		db:  db,
+		mux: http.NewServeMux(),
+	}
+
+	s.mux.Handle("/debug", http.HandlerFunc(s.debug))
+
+	s.mux.Handle("/new-transaction", httpPostJSONHandler(s.newTransaction))
+	s.mux.Handle("/new-snapshot", httpPostJSONHandler(s.newSnapshot))
+
+	s.mux.Handle("/tx/get", httpPostJSONHandler(s.get))
+	s.mux.Handle("/tx/set", httpPostJSONHandler(s.set))
+	s.mux.Handle("/tx/del", httpPostJSONHandler(s.del))
+	s.mux.Handle("/tx/delete", httpPostJSONHandler(s.del))
+	s.mux.Handle("/tx/ascend", httpPostJSONHandler(s.ascend))
+	s.mux.Handle("/tx/descend", httpPostJSONHandler(s.descend))
+	s.mux.Handle("/tx/scan", httpPostJSONHandler(s.scan))
+	s.mux.Handle("/tx/commit", httpPostJSONHandler(s.commit))
+	s.mux.Handle("/tx/rollback", httpPostJSONHandler(s.rollback))
+
+	s.mux.Handle("/snap/get", httpPostJSONHandler(s.get))
+	s.mux.Handle("/snap/ascend", httpPostJSONHandler(s.ascend))
+	s.mux.Handle("/snap/descend", httpPostJSONHandler(s.descend))
+	s.mux.Handle("/snap/scan", httpPostJSONHandler(s.scan))
+	s.mux.Handle("/snap/discard", httpPostJSONHandler(s.discard))
+
+	s.mux.Handle("/it/next", httpPostJSONHandler(s.next))
+	return s.mux
+}
+
+func (s *server[T, S]) Close() error {
+	for _, itd := range s.itDataMap.Range {
+		itd.Close()
+	}
+	for _, snap := range s.snapMap.Range {
+		snap.Discard(context.Background())
+	}
+	for _, tx := range s.txMap.Range {
+		tx.Rollback(context.Background())
+	}
+	s.itDataMap = syncmap.Map[uuid.UUID, *iterData]{}
+	s.snapMap = syncmap.Map[uuid.UUID, kv.Snapshot]{}
+	s.txMap = syncmap.Map[uuid.UUID, kv.Transaction]{}
+	return nil
+}
+
+func (s *server[T, S]) LockCreate(name string) (id uuid.UUID, exists bool) {
+	n := &idLock{
+		id: uuid.New(),
+	}
+	if v, loaded := s.nameMap.LoadOrStore(name, n); loaded {
+		v.mu.Lock()
+		return v.id, true
+	}
+	n.mu.Lock()
+	return n.id, false
+}
+
+func (s *server[T, S]) LockExisting(name string) (id uuid.UUID, ok bool) {
+	v, ok := s.nameMap.Load(name)
+	if !ok {
+		return id, false
+	}
+	v.mu.Lock()
+	return v.id, true
+}
+
+func (s *server[T, S]) resolveName(name string) (id uuid.UUID, ok bool) {
+	v, ok := s.nameMap.Load(name)
+	if !ok {
+		return id, false
+	}
+	return v.id, true
+}
+
+func (s *server[T, S]) deleteName(name string) {
+	s.nameMap.Delete(name)
+}
+
+func (s *server[T, S]) Unlock(name string, delete bool) {
+	v, ok := s.nameMap.Load(name)
+	if !ok {
+		return
+	}
+	if delete {
+		s.nameMap.Delete(name)
+	}
+	v.mu.Unlock()
+}
+
+type statusErr struct {
+	code int
+	err  error
+}
+
+func (s *statusErr) Error() string {
+	return fmt.Sprintf("status code %d: %s", s.code, s.err.Error())
+}
+
+func httpPostJSONHandler[T1 any, T2 any](fun func(context.Context, *url.URL, *T1) (*T2, error)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			log.Printf("invalid method type")
+			http.Error(w, "invalid http method type", http.StatusMethodNotAllowed)
+			return
+		}
+		if v := r.Header.Get("content-type"); !strings.EqualFold(v, "application/json") {
+			log.Printf("unsupported content type")
+			http.Error(w, "unsupported content type", http.StatusBadRequest)
+			return
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("invalid body")
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+
+		var req *T1
+		if len(data) > 0 {
+			req = new(T1)
+			if err := json.Unmarshal(data, req); err != nil {
+				log.Printf("bad request payload: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+
+		resp, err := fun(r.Context(), r.URL, req)
+		if err != nil {
+			if se := new(statusErr); errors.As(err, &se) {
+				http.Error(w, se.Error(), se.code)
+				return
+			}
+			if errors.Is(err, os.ErrNotExist) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		jsbytes, err := json.Marshal(resp)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write(jsbytes)
+	})
+}
+
+func (s *server[T, S]) debug(http.ResponseWriter, *http.Request) {
+	// log.Printf("kvhttp: nameMap:%d txMap:%d itMap:%d snapMap:%d txItersMap:%d snapItersMap:%d", size(&s.nameMap), size(&s.txMap), size(&s.itMap), size(&s.snapMap), size(&s.txItersMap), size(&s.snapItersMap))
+}
+
+func (s *server[T, S]) newTransaction(ctx context.Context, u *url.URL, req *api.NewTransactionRequest) (*api.NewTransactionResponse, error) {
+	id, exists := s.LockCreate(req.Name)
+	defer s.Unlock(req.Name, false /* delete */)
+
+	if exists {
+		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
+	}
+
+	tx, err := s.db.NewTransaction(ctx)
+	if err != nil {
+		s.deleteName(req.Name)
+		return &api.NewTransactionResponse{Error: error2string(err)}, nil
+	}
+
+	s.txMap.Store(id, tx)
+	return &api.NewTransactionResponse{}, nil
+}
+
+func (s *server[T, S]) set(ctx context.Context, u *url.URL, req *api.SetRequest) (*api.SetResponse, error) {
+	id, ok := s.LockExisting(req.Transaction)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+	defer s.Unlock(req.Transaction, false /* delete */)
+
+	tx, ok := s.txMap.Load(id)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+
+	if err := tx.Set(ctx, req.Key, bytes.NewReader(req.Value)); err != nil {
+		return &api.SetResponse{Error: error2string(err)}, nil
+	}
+	return &api.SetResponse{}, nil
+}
+
+func (s *server[T, S]) del(ctx context.Context, u *url.URL, req *api.DeleteRequest) (*api.DeleteResponse, error) {
+	id, ok := s.LockExisting(req.Transaction)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+	defer s.Unlock(req.Transaction, false /* delete */)
+
+	tx, ok := s.txMap.Load(id)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+
+	if err := tx.Delete(ctx, req.Key); err != nil {
+		return &api.DeleteResponse{Error: error2string(err)}, nil
+	}
+	return &api.DeleteResponse{}, nil
+}
+
+func (s *server[T, S]) commit(ctx context.Context, u *url.URL, req *api.CommitRequest) (*api.CommitResponse, error) {
+	id, ok := s.LockExisting(req.Transaction)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+	defer s.Unlock(req.Transaction, true /* delete */)
+
+	tx, ok := s.txMap.Load(id)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+	s.txMap.Delete(id)
+
+	// Close all iterators and delete the iterator names as well.
+	if iters, ok := s.txItersMap.Load(id); ok {
+		for _, iter := range iters {
+			if id, ok := s.resolveName(iter); ok {
+				if itd, ok := s.itDataMap.LoadAndDelete(id); ok {
+					itd.Close()
+				}
+			}
+			s.deleteName(iter)
+		}
+		s.txItersMap.Delete(id)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return &api.CommitResponse{Error: error2string(err)}, nil
+	}
+	return &api.CommitResponse{}, nil
+}
+
+func (s *server[T, S]) rollback(ctx context.Context, u *url.URL, req *api.RollbackRequest) (*api.RollbackResponse, error) {
+	id, ok := s.LockExisting(req.Transaction)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+	defer s.Unlock(req.Transaction, true /* delete */)
+
+	tx, ok := s.txMap.Load(id)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+	s.txMap.Delete(id)
+
+	if iters, ok := s.txItersMap.Load(id); ok {
+		for _, iter := range iters {
+			if id, ok := s.resolveName(iter); ok {
+				if itd, ok := s.itDataMap.LoadAndDelete(id); ok {
+					itd.Close()
+				}
+			}
+			s.deleteName(iter)
+		}
+		s.txItersMap.Delete(id)
+	}
+
+	if err := tx.Rollback(ctx); err != nil {
+		return &api.RollbackResponse{Error: error2string(err)}, nil
+	}
+	return &api.RollbackResponse{}, nil
+}
+
+func (s *server[T, S]) newSnapshot(ctx context.Context, u *url.URL, req *api.NewSnapshotRequest) (*api.NewSnapshotResponse, error) {
+	id, exists := s.LockCreate(req.Name)
+	defer s.Unlock(req.Name, false /* delete */)
+
+	if exists {
+		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
+	}
+
+	snap, err := s.db.NewSnapshot(ctx)
+	if err != nil {
+		s.deleteName(req.Name)
+		return &api.NewSnapshotResponse{Error: error2string(err)}, nil
+	}
+
+	s.snapMap.Store(id, snap)
+	return &api.NewSnapshotResponse{}, nil
+}
+
+func (s *server[T, S]) discard(ctx context.Context, u *url.URL, req *api.DiscardRequest) (*api.DiscardResponse, error) {
+	id, ok := s.LockExisting(req.Snapshot)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+	defer s.Unlock(req.Snapshot, true /* delete */)
+
+	snap, ok := s.snapMap.Load(id)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+	s.snapMap.Delete(id)
+
+	if iters, ok := s.snapItersMap.Load(id); ok {
+		for _, iter := range iters {
+			if id, ok := s.resolveName(iter); ok {
+				if itd, ok := s.itDataMap.LoadAndDelete(id); ok {
+					itd.Close()
+				}
+			}
+			s.deleteName(iter)
+		}
+		s.snapItersMap.Delete(id)
+	}
+
+	if err := snap.Discard(ctx); err != nil {
+		return &api.DiscardResponse{Error: error2string(err)}, nil
+	}
+	return &api.DiscardResponse{}, nil
+}
+
+func (s *server[T, S]) get(ctx context.Context, u *url.URL, req *api.GetRequest) (*api.GetResponse, error) {
+	if len(req.Transaction) == 0 && len(req.Snapshot) == 0 {
+		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
+	}
+	if len(req.Transaction) != 0 && len(req.Snapshot) != 0 {
+		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
+	}
+
+	var getter kv.Getter
+	if len(req.Transaction) != 0 {
+		id, ok := s.LockExisting(req.Transaction)
+		if !ok {
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		defer s.Unlock(req.Transaction, false /* delete */)
+
+		tx, ok := s.txMap.Load(id)
+		if !ok {
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		getter = tx
+	} else {
+		id, ok := s.LockExisting(req.Snapshot)
+		if !ok {
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		defer s.Unlock(req.Snapshot, false /* delete */)
+
+		snap, ok := s.snapMap.Load(id)
+		if !ok {
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		getter = snap
+	}
+
+	v, err := getter.Get(ctx, req.Key)
+	if err != nil {
+		return &api.GetResponse{Error: error2string(err)}, nil
+	}
+	data, err := io.ReadAll(v)
+	if err != nil {
+		return nil, err
+	}
+	return &api.GetResponse{Value: data}, nil
+}
+
+func (s *server[T, S]) ascend(ctx context.Context, u *url.URL, req *api.AscendRequest) (*api.AscendResponse, error) {
+	if len(req.Transaction) == 0 && len(req.Snapshot) == 0 {
+		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
+	}
+	if len(req.Transaction) != 0 && len(req.Snapshot) != 0 {
+		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
+	}
+
+	id, exists := s.LockCreate(req.Name)
+	defer s.Unlock(req.Name, false /* delete */)
+	if exists {
+		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
+	}
+
+	var ranger kv.Ranger
+	var rangerID uuid.UUID
+	var rangerItersMap *syncmap.Map[uuid.UUID, []string]
+	if len(req.Transaction) != 0 {
+		id, ok := s.LockExisting(req.Transaction)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		defer s.Unlock(req.Transaction, false /* delete */)
+
+		tx, ok := s.txMap.Load(id)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		ranger = tx
+		rangerID = id
+		rangerItersMap = &s.txItersMap
+	} else {
+		id, ok := s.LockExisting(req.Snapshot)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		defer s.Unlock(req.Snapshot, false /* delete */)
+
+		snap, ok := s.snapMap.Load(id)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		ranger = snap
+		rangerID = id
+		rangerItersMap = &s.snapItersMap
+	}
+
+	// save the iterator id in iterators-map and it's name in one of tx's or
+	// snapshot's iterators map.
+	itd := new(iterData)
+	itd.ctx, itd.ctxCancel = context.WithCancel(context.Background())
+	itd.iter = ranger.Ascend(ctx, req.Begin, req.End, &itd.err)
+	itd.next, itd.stop = iter.Pull2(itd.iter)
+
+	s.itDataMap.Store(id, itd)
+	iters, _ := rangerItersMap.Load(rangerID)
+	rangerItersMap.Store(rangerID, append(iters, req.Name))
+
+	return &api.AscendResponse{}, nil
+}
+
+func (s *server[T, S]) descend(ctx context.Context, u *url.URL, req *api.DescendRequest) (*api.DescendResponse, error) {
+	if len(req.Transaction) == 0 && len(req.Snapshot) == 0 {
+		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
+	}
+	if len(req.Transaction) != 0 && len(req.Snapshot) != 0 {
+		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
+	}
+
+	id, exists := s.LockCreate(req.Name)
+	defer s.Unlock(req.Name, false /* delete */)
+	if exists {
+		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
+	}
+
+	var ranger kv.Ranger
+	var rangerID uuid.UUID
+	var rangerItersMap *syncmap.Map[uuid.UUID, []string]
+	if len(req.Transaction) != 0 {
+		id, ok := s.LockExisting(req.Transaction)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		defer s.Unlock(req.Transaction, false /* delete */)
+
+		tx, ok := s.txMap.Load(id)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		ranger = tx
+		rangerID = id
+		rangerItersMap = &s.txItersMap
+	} else {
+		id, ok := s.LockExisting(req.Snapshot)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		defer s.Unlock(req.Snapshot, false /* delete */)
+
+		snap, ok := s.snapMap.Load(id)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		ranger = snap
+		rangerID = id
+		rangerItersMap = &s.snapItersMap
+	}
+
+	// save the iterator id in iterators-map and it's name in one of tx's or
+	// snapshot's iterators map.
+	itd := new(iterData)
+	itd.ctx, itd.ctxCancel = context.WithCancel(context.Background())
+	itd.iter = ranger.Descend(ctx, req.Begin, req.End, &itd.err)
+	itd.next, itd.stop = iter.Pull2(itd.iter)
+
+	s.itDataMap.Store(id, itd)
+	iters, _ := rangerItersMap.Load(rangerID)
+	rangerItersMap.Store(rangerID, append(iters, req.Name))
+
+	return &api.DescendResponse{}, nil
+}
+
+func (s *server[T, S]) scan(ctx context.Context, u *url.URL, req *api.ScanRequest) (*api.ScanResponse, error) {
+	if len(req.Transaction) == 0 && len(req.Snapshot) == 0 {
+		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
+	}
+	if len(req.Transaction) != 0 && len(req.Snapshot) != 0 {
+		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
+	}
+
+	id, exists := s.LockCreate(req.Name)
+	defer s.Unlock(req.Name, false /* delete */)
+	if exists {
+		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
+	}
+
+	var scanner kv.Scanner
+	var scannerID uuid.UUID
+	var scannerItersMap *syncmap.Map[uuid.UUID, []string]
+	if len(req.Transaction) != 0 {
+		id, ok := s.LockExisting(req.Transaction)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		defer s.Unlock(req.Transaction, false /* delete */)
+
+		tx, ok := s.txMap.Load(id)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		scanner = tx
+		scannerID = id
+		scannerItersMap = &s.txItersMap
+	} else {
+		id, ok := s.LockExisting(req.Snapshot)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		defer s.Unlock(req.Snapshot, false /* delete */)
+
+		snap, ok := s.snapMap.Load(id)
+		if !ok {
+			s.deleteName(req.Name)
+			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+		}
+		scanner = snap
+		scannerID = id
+		scannerItersMap = &s.snapItersMap
+	}
+
+	// save the iterator id in iterators-map and it's name in one of tx's or
+	// snapshot's iterators map.
+	itd := new(iterData)
+	itd.ctx, itd.ctxCancel = context.WithCancel(context.Background())
+	itd.iter = scanner.Scan(ctx, &itd.err)
+	itd.next, itd.stop = iter.Pull2(itd.iter)
+
+	s.itDataMap.Store(id, itd)
+	iters, _ := scannerItersMap.Load(scannerID)
+	scannerItersMap.Store(scannerID, append(iters, req.Name))
+
+	return &api.ScanResponse{}, nil
+}
+
+func (s *server[T, S]) next(ctx context.Context, u *url.URL, req *api.NextRequest) (*api.NextResponse, error) {
+	id, ok := s.LockExisting(req.Iterator)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+	defer s.Unlock(req.Iterator, false /* delete */)
+
+	itd, ok := s.itDataMap.Load(id)
+	if !ok {
+		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	}
+
+	if key, value, ok := itd.next(); ok {
+		data, err := io.ReadAll(value)
+		if err != nil {
+			return &api.NextResponse{Error: error2string(err)}, nil
+		}
+		return &api.NextResponse{Key: key, Value: data}, nil
+	}
+	if itd.err != nil {
+		return &api.NextResponse{Error: error2string(itd.err)}, nil
+	}
+	return &api.NextResponse{}, nil
+}
