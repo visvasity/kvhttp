@@ -46,7 +46,8 @@ func (itd *iterData) Close() {
 }
 
 type server[T kv.Transaction, S kv.Snapshot] struct {
-	db kv.Database[T, S]
+	newTx   kv.NewTransactionFunc[T]
+	newSnap kv.NewSnapshotFunc[S]
 
 	mux *http.ServeMux
 
@@ -78,10 +79,11 @@ func size[K comparable, V any](m *syncmap.Map[K, V]) int {
 	return n
 }
 
-func Handler[T kv.Transaction, S kv.Snapshot](db kv.Database[T, S]) http.Handler {
+func Handler[T kv.Transaction, S kv.Snapshot](newTx kv.NewTransactionFunc[T], newSnap kv.NewSnapshotFunc[S]) http.Handler {
 	s := &server[T, S]{
-		db:  db,
-		mux: http.NewServeMux(),
+		newTx:   newTx,
+		newSnap: newSnap,
+		mux:     http.NewServeMux(),
 	}
 
 	s.mux.Handle("/debug", http.HandlerFunc(s.debug))
@@ -242,7 +244,7 @@ func (s *server[T, S]) newTransaction(ctx context.Context, u *url.URL, req *api.
 		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
 	}
 
-	tx, err := s.db.NewTransaction(ctx)
+	tx, err := s.newTx(ctx)
 	if err != nil {
 		s.deleteName(req.Name)
 		return &api.NewTransactionResponse{Error: error2string(err)}, nil
@@ -359,7 +361,7 @@ func (s *server[T, S]) newSnapshot(ctx context.Context, u *url.URL, req *api.New
 		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
 	}
 
-	snap, err := s.db.NewSnapshot(ctx)
+	snap, err := s.newSnap(ctx)
 	if err != nil {
 		s.deleteName(req.Name)
 		return &api.NewSnapshotResponse{Error: error2string(err)}, nil

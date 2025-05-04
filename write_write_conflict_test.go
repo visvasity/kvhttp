@@ -17,7 +17,8 @@ import (
 func TestWriteWriteConflict(t *testing.T) {
 	ctx := context.Background()
 
-	dbServer := httptest.NewServer(Handler(kvmemdb.New()))
+	mdb := kvmemdb.New()
+	dbServer := httptest.NewServer(Handler(mdb.NewTransaction, mdb.NewSnapshot))
 	defer dbServer.Close()
 
 	dbURL, err := url.Parse(dbServer.URL)
@@ -28,7 +29,7 @@ func TestWriteWriteConflict(t *testing.T) {
 	db := New(dbURL, dbServer.Client())
 
 	// Initialize with a key
-	err = kv.WithReadWriter(ctx, db, func(ctx context.Context, rw kv.ReadWriter) error {
+	err = kv.WithReadWriter(ctx, db.NewTransaction, func(ctx context.Context, rw kv.ReadWriter) error {
 		return rw.Set(ctx, "key1", strings.NewReader("initial"))
 	})
 	if err != nil {
@@ -76,7 +77,7 @@ func TestWriteWriteConflict(t *testing.T) {
 
 	// Check final state
 	var finalValue string
-	err = kv.WithReader(ctx, db, func(ctx context.Context, r kv.Reader) error {
+	err = kv.WithReader(ctx, db.NewSnapshot, func(ctx context.Context, r kv.Reader) error {
 		reader, err := r.Get(ctx, "key1")
 		if err != nil {
 			return err

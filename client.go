@@ -15,11 +15,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/visvasity/kv"
 	"github.com/visvasity/kvhttp/api"
 )
-
-var _ kv.Database[*Tx, *Snap] = &DB{}
 
 type DB struct {
 	dbURL url.URL
