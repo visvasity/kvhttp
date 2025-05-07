@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/visvasity/kv"
+	"github.com/visvasity/kv/kvutil"
 	"github.com/visvasity/kvhttp/api"
 	"github.com/visvasity/syncmap"
 )
@@ -46,8 +47,8 @@ func (itd *iterData) Close() {
 }
 
 type server[T kv.Transaction, S kv.Snapshot] struct {
-	newTx   kv.NewTransactionFunc[T]
-	newSnap kv.NewSnapshotFunc[S]
+	newTx   kvutil.NewTransactionFunc[T]
+	newSnap kvutil.NewSnapshotFunc[S]
 
 	mux *http.ServeMux
 
@@ -79,7 +80,7 @@ func size[K comparable, V any](m *syncmap.Map[K, V]) int {
 	return n
 }
 
-func Handler[T kv.Transaction, S kv.Snapshot](newTx kv.NewTransactionFunc[T], newSnap kv.NewSnapshotFunc[S]) http.Handler {
+func Handler[T kv.Transaction, S kv.Snapshot](newTx kvutil.NewTransactionFunc[T], newSnap kvutil.NewSnapshotFunc[S]) http.Handler {
 	s := &server[T, S]{
 		newTx:   newTx,
 		newSnap: newSnap,
