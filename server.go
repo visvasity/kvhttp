@@ -20,7 +20,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/visvasity/kv"
-	"github.com/visvasity/kv/kvutil"
 	"github.com/visvasity/kvhttp/api"
 	"github.com/visvasity/syncmap"
 )
@@ -46,9 +45,8 @@ func (itd *iterData) Close() {
 	itd.stop()
 }
 
-type server[T kv.Transaction, S kv.Snapshot] struct {
-	newTx   kvutil.NewTransactionFunc[T]
-	newSnap kvutil.NewSnapshotFunc[S]
+type server struct {
+	db kv.Database
 
 	mux *http.ServeMux
 
@@ -80,11 +78,10 @@ func size[K comparable, V any](m *syncmap.Map[K, V]) int {
 	return n
 }
 
-func Handler[T kv.Transaction, S kv.Snapshot](newTx kvutil.NewTransactionFunc[T], newSnap kvutil.NewSnapshotFunc[S]) http.Handler {
-	s := &server[T, S]{
-		newTx:   newTx,
-		newSnap: newSnap,
-		mux:     http.NewServeMux(),
+func Handler(db kv.Database) http.Handler {
+	s := &server{
+		db:  db,
+		mux: http.NewServeMux(),
 	}
 
 	s.mux.Handle("/debug", http.HandlerFunc(s.debug))
@@ -112,7 +109,7 @@ func Handler[T kv.Transaction, S kv.Snapshot](newTx kvutil.NewTransactionFunc[T]
 	return s.mux
 }
 
-func (s *server[T, S]) Close() error {
+func (s *server) Close() error {
 	for _, itd := range s.itDataMap.Range {
 		itd.Close()
 	}
@@ -128,7 +125,7 @@ func (s *server[T, S]) Close() error {
 	return nil
 }
 
-func (s *server[T, S]) LockCreate(name string) (id uuid.UUID, exists bool) {
+func (s *server) LockCreate(name string) (id uuid.UUID, exists bool) {
 	n := &idLock{
 		id: uuid.New(),
 	}
@@ -140,7 +137,7 @@ func (s *server[T, S]) LockCreate(name string) (id uuid.UUID, exists bool) {
 	return n.id, false
 }
 
-func (s *server[T, S]) LockExisting(name string) (id uuid.UUID, ok bool) {
+func (s *server) LockExisting(name string) (id uuid.UUID, ok bool) {
 	v, ok := s.nameMap.Load(name)
 	if !ok {
 		return id, false
@@ -149,7 +146,7 @@ func (s *server[T, S]) LockExisting(name string) (id uuid.UUID, ok bool) {
 	return v.id, true
 }
 
-func (s *server[T, S]) resolveName(name string) (id uuid.UUID, ok bool) {
+func (s *server) resolveName(name string) (id uuid.UUID, ok bool) {
 	v, ok := s.nameMap.Load(name)
 	if !ok {
 		return id, false
@@ -157,11 +154,11 @@ func (s *server[T, S]) resolveName(name string) (id uuid.UUID, ok bool) {
 	return v.id, true
 }
 
-func (s *server[T, S]) deleteName(name string) {
+func (s *server) deleteName(name string) {
 	s.nameMap.Delete(name)
 }
 
-func (s *server[T, S]) Unlock(name string, delete bool) {
+func (s *server) Unlock(name string, delete bool) {
 	v, ok := s.nameMap.Load(name)
 	if !ok {
 		return
@@ -233,11 +230,11 @@ func httpPostJSONHandler[T1 any, T2 any](fun func(context.Context, *url.URL, *T1
 	})
 }
 
-func (s *server[T, S]) debug(http.ResponseWriter, *http.Request) {
+func (s *server) debug(http.ResponseWriter, *http.Request) {
 	// log.Printf("kvhttp: nameMap:%d txMap:%d itMap:%d snapMap:%d txItersMap:%d snapItersMap:%d", size(&s.nameMap), size(&s.txMap), size(&s.itMap), size(&s.snapMap), size(&s.txItersMap), size(&s.snapItersMap))
 }
 
-func (s *server[T, S]) newTransaction(ctx context.Context, u *url.URL, req *api.NewTransactionRequest) (*api.NewTransactionResponse, error) {
+func (s *server) newTransaction(ctx context.Context, u *url.URL, req *api.NewTransactionRequest) (*api.NewTransactionResponse, error) {
 	id, exists := s.LockCreate(req.Name)
 	defer s.Unlock(req.Name, false /* delete */)
 
@@ -245,7 +242,7 @@ func (s *server[T, S]) newTransaction(ctx context.Context, u *url.URL, req *api.
 		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
 	}
 
-	tx, err := s.newTx(ctx)
+	tx, err := s.db.NewTransaction(ctx)
 	if err != nil {
 		s.deleteName(req.Name)
 		return &api.NewTransactionResponse{Error: error2string(err)}, nil
@@ -255,7 +252,7 @@ func (s *server[T, S]) newTransaction(ctx context.Context, u *url.URL, req *api.
 	return &api.NewTransactionResponse{}, nil
 }
 
-func (s *server[T, S]) set(ctx context.Context, u *url.URL, req *api.SetRequest) (*api.SetResponse, error) {
+func (s *server) set(ctx context.Context, u *url.URL, req *api.SetRequest) (*api.SetResponse, error) {
 	id, ok := s.LockExisting(req.Transaction)
 	if !ok {
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
@@ -273,7 +270,7 @@ func (s *server[T, S]) set(ctx context.Context, u *url.URL, req *api.SetRequest)
 	return &api.SetResponse{}, nil
 }
 
-func (s *server[T, S]) del(ctx context.Context, u *url.URL, req *api.DeleteRequest) (*api.DeleteResponse, error) {
+func (s *server) del(ctx context.Context, u *url.URL, req *api.DeleteRequest) (*api.DeleteResponse, error) {
 	id, ok := s.LockExisting(req.Transaction)
 	if !ok {
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
@@ -291,7 +288,7 @@ func (s *server[T, S]) del(ctx context.Context, u *url.URL, req *api.DeleteReque
 	return &api.DeleteResponse{}, nil
 }
 
-func (s *server[T, S]) commit(ctx context.Context, u *url.URL, req *api.CommitRequest) (*api.CommitResponse, error) {
+func (s *server) commit(ctx context.Context, u *url.URL, req *api.CommitRequest) (*api.CommitResponse, error) {
 	id, ok := s.LockExisting(req.Transaction)
 	if !ok {
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
@@ -323,7 +320,7 @@ func (s *server[T, S]) commit(ctx context.Context, u *url.URL, req *api.CommitRe
 	return &api.CommitResponse{}, nil
 }
 
-func (s *server[T, S]) rollback(ctx context.Context, u *url.URL, req *api.RollbackRequest) (*api.RollbackResponse, error) {
+func (s *server) rollback(ctx context.Context, u *url.URL, req *api.RollbackRequest) (*api.RollbackResponse, error) {
 	id, ok := s.LockExisting(req.Transaction)
 	if !ok {
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
@@ -354,7 +351,7 @@ func (s *server[T, S]) rollback(ctx context.Context, u *url.URL, req *api.Rollba
 	return &api.RollbackResponse{}, nil
 }
 
-func (s *server[T, S]) newSnapshot(ctx context.Context, u *url.URL, req *api.NewSnapshotRequest) (*api.NewSnapshotResponse, error) {
+func (s *server) newSnapshot(ctx context.Context, u *url.URL, req *api.NewSnapshotRequest) (*api.NewSnapshotResponse, error) {
 	id, exists := s.LockCreate(req.Name)
 	defer s.Unlock(req.Name, false /* delete */)
 
@@ -362,7 +359,7 @@ func (s *server[T, S]) newSnapshot(ctx context.Context, u *url.URL, req *api.New
 		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
 	}
 
-	snap, err := s.newSnap(ctx)
+	snap, err := s.db.NewSnapshot(ctx)
 	if err != nil {
 		s.deleteName(req.Name)
 		return &api.NewSnapshotResponse{Error: error2string(err)}, nil
@@ -372,7 +369,7 @@ func (s *server[T, S]) newSnapshot(ctx context.Context, u *url.URL, req *api.New
 	return &api.NewSnapshotResponse{}, nil
 }
 
-func (s *server[T, S]) discard(ctx context.Context, u *url.URL, req *api.DiscardRequest) (*api.DiscardResponse, error) {
+func (s *server) discard(ctx context.Context, u *url.URL, req *api.DiscardRequest) (*api.DiscardResponse, error) {
 	id, ok := s.LockExisting(req.Snapshot)
 	if !ok {
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
@@ -403,7 +400,7 @@ func (s *server[T, S]) discard(ctx context.Context, u *url.URL, req *api.Discard
 	return &api.DiscardResponse{}, nil
 }
 
-func (s *server[T, S]) get(ctx context.Context, u *url.URL, req *api.GetRequest) (*api.GetResponse, error) {
+func (s *server) get(ctx context.Context, u *url.URL, req *api.GetRequest) (*api.GetResponse, error) {
 	if len(req.Transaction) == 0 && len(req.Snapshot) == 0 {
 		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
 	}
@@ -449,7 +446,7 @@ func (s *server[T, S]) get(ctx context.Context, u *url.URL, req *api.GetRequest)
 	return &api.GetResponse{Value: data}, nil
 }
 
-func (s *server[T, S]) ascend(ctx context.Context, u *url.URL, req *api.AscendRequest) (*api.AscendResponse, error) {
+func (s *server) ascend(ctx context.Context, u *url.URL, req *api.AscendRequest) (*api.AscendResponse, error) {
 	if len(req.Transaction) == 0 && len(req.Snapshot) == 0 {
 		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
 	}
@@ -514,7 +511,7 @@ func (s *server[T, S]) ascend(ctx context.Context, u *url.URL, req *api.AscendRe
 	return &api.AscendResponse{}, nil
 }
 
-func (s *server[T, S]) descend(ctx context.Context, u *url.URL, req *api.DescendRequest) (*api.DescendResponse, error) {
+func (s *server) descend(ctx context.Context, u *url.URL, req *api.DescendRequest) (*api.DescendResponse, error) {
 	if len(req.Transaction) == 0 && len(req.Snapshot) == 0 {
 		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
 	}
@@ -579,7 +576,7 @@ func (s *server[T, S]) descend(ctx context.Context, u *url.URL, req *api.Descend
 	return &api.DescendResponse{}, nil
 }
 
-func (s *server[T, S]) scan(ctx context.Context, u *url.URL, req *api.ScanRequest) (*api.ScanResponse, error) {
+func (s *server) scan(ctx context.Context, u *url.URL, req *api.ScanRequest) (*api.ScanResponse, error) {
 	if len(req.Transaction) == 0 && len(req.Snapshot) == 0 {
 		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
 	}
@@ -644,7 +641,7 @@ func (s *server[T, S]) scan(ctx context.Context, u *url.URL, req *api.ScanReques
 	return &api.ScanResponse{}, nil
 }
 
-func (s *server[T, S]) next(ctx context.Context, u *url.URL, req *api.NextRequest) (*api.NextResponse, error) {
+func (s *server) next(ctx context.Context, u *url.URL, req *api.NextRequest) (*api.NextResponse, error) {
 	id, ok := s.LockExisting(req.Iterator)
 	if !ok {
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}

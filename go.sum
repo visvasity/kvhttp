@@ -6,6 +6,8 @@ github.com/visvasity/kv v0.0.0-20250504050644-520be992be3c h1:Q9j2mICQunsMoNTJ4D
 github.com/visvasity/kv v0.0.0-20250504050644-520be992be3c/go.mod h1:CZqPYUOKOBKISPpVXqWdRQJQqxRT3n9//U9PULXfpbY=
 github.com/visvasity/kv v0.0.0-20250507124622-6d2db50b9917 h1:WMMZyKM7JDiEJpZVouk6H2vMhrSFOag1yijtBZKl7B0=
 github.com/visvasity/kv v0.0.0-20250507124622-6d2db50b9917/go.mod h1:CZqPYUOKOBKISPpVXqWdRQJQqxRT3n9//U9PULXfpbY=
+github.com/visvasity/kv v0.0.0-20250508033112-397c38338d68 h1:kIdzttqkI1oMKg5W9GJxMijLuhs23YECNQ+Ym4ZKNvQ=
+github.com/visvasity/kv v0.0.0-20250508033112-397c38338d68/go.mod h1:CZqPYUOKOBKISPpVXqWdRQJQqxRT3n9//U9PULXfpbY=
 github.com/visvasity/kvmemdb v0.0.0-20250422160013-f3aa370fcb6b h1:F6I/pXVWJ93MMfM9cflf/L93zvO8JVRokBmY1+zkfIg=
 github.com/visvasity/kvmemdb v0.0.0-20250422160013-f3aa370fcb6b/go.mod h1:Mjs2rOgIUYXF5rfdrUlBZfvYPW5f9Uu4NqzQ36a3Bbk=
 github.com/visvasity/kvmemdb v0.0.0-20250507225356-026151db4347 h1:oop6SudAqD10XiYbeEqmgagb31v9PyFKTs/Lx8XO2bY=
