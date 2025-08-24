@@ -95,14 +95,12 @@ func Handler(db kv.Database) http.Handler {
 	s.mux.Handle("/tx/delete", httpPostJSONHandler(s.del))
 	s.mux.Handle("/tx/ascend", httpPostJSONHandler(s.ascend))
 	s.mux.Handle("/tx/descend", httpPostJSONHandler(s.descend))
-	s.mux.Handle("/tx/scan", httpPostJSONHandler(s.scan))
 	s.mux.Handle("/tx/commit", httpPostJSONHandler(s.commit))
 	s.mux.Handle("/tx/rollback", httpPostJSONHandler(s.rollback))
 
 	s.mux.Handle("/snap/get", httpPostJSONHandler(s.get))
 	s.mux.Handle("/snap/ascend", httpPostJSONHandler(s.ascend))
 	s.mux.Handle("/snap/descend", httpPostJSONHandler(s.descend))
-	s.mux.Handle("/snap/scan", httpPostJSONHandler(s.scan))
 	s.mux.Handle("/snap/discard", httpPostJSONHandler(s.discard))
 
 	s.mux.Handle("/it/next", httpPostJSONHandler(s.next))
@@ -574,71 +572,6 @@ func (s *server) descend(ctx context.Context, u *url.URL, req *api.DescendReques
 	rangerItersMap.Store(rangerID, append(iters, req.Name))
 
 	return &api.DescendResponse{}, nil
-}
-
-func (s *server) scan(ctx context.Context, u *url.URL, req *api.ScanRequest) (*api.ScanResponse, error) {
-	if len(req.Transaction) == 0 && len(req.Snapshot) == 0 {
-		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
-	}
-	if len(req.Transaction) != 0 && len(req.Snapshot) != 0 {
-		return nil, &statusErr{err: os.ErrInvalid, code: http.StatusBadRequest}
-	}
-
-	id, exists := s.LockCreate(req.Name)
-	defer s.Unlock(req.Name, false /* delete */)
-	if exists {
-		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
-	}
-
-	var scanner kv.Scanner
-	var scannerID uuid.UUID
-	var scannerItersMap *syncmap.Map[uuid.UUID, []string]
-	if len(req.Transaction) != 0 {
-		id, ok := s.LockExisting(req.Transaction)
-		if !ok {
-			s.deleteName(req.Name)
-			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
-		}
-		defer s.Unlock(req.Transaction, false /* delete */)
-
-		tx, ok := s.txMap.Load(id)
-		if !ok {
-			s.deleteName(req.Name)
-			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
-		}
-		scanner = tx
-		scannerID = id
-		scannerItersMap = &s.txItersMap
-	} else {
-		id, ok := s.LockExisting(req.Snapshot)
-		if !ok {
-			s.deleteName(req.Name)
-			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
-		}
-		defer s.Unlock(req.Snapshot, false /* delete */)
-
-		snap, ok := s.snapMap.Load(id)
-		if !ok {
-			s.deleteName(req.Name)
-			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
-		}
-		scanner = snap
-		scannerID = id
-		scannerItersMap = &s.snapItersMap
-	}
-
-	// save the iterator id in iterators-map and it's name in one of tx's or
-	// snapshot's iterators map.
-	itd := new(iterData)
-	itd.ctx, itd.ctxCancel = context.WithCancel(context.Background())
-	itd.iter = scanner.Scan(ctx, &itd.err)
-	itd.next, itd.stop = iter.Pull2(itd.iter)
-
-	s.itDataMap.Store(id, itd)
-	iters, _ := scannerItersMap.Load(scannerID)
-	scannerItersMap.Store(scannerID, append(iters, req.Name))
-
-	return &api.ScanResponse{}, nil
 }
 
 func (s *server) next(ctx context.Context, u *url.URL, req *api.NextRequest) (*api.NextResponse, error) {

@@ -22,7 +22,7 @@ func TestAscendDescend(t *testing.T) {
 	ctx := context.Background()
 
 	mdb := kvmemdb.New()
-	dbServer := httptest.NewServer(Handler(kv.DatabaseFrom(mdb.NewTransaction, mdb.NewSnapshot)))
+	dbServer := httptest.NewServer(Handler(kv.DatabaseFrom(mdb)))
 	defer dbServer.Close()
 
 	dbURL, err := url.Parse(dbServer.URL)
@@ -31,7 +31,7 @@ func TestAscendDescend(t *testing.T) {
 	}
 
 	cdb := New(dbURL, dbServer.Client())
-	db := kv.DatabaseFrom(cdb.NewTransaction, cdb.NewSnapshot)
+	db := kv.DatabaseFrom(cdb)
 
 	// Setup test data.
 	err = kvutil.WithReadWriter(ctx, db, func(ctx context.Context, rw kv.ReadWriter) error {

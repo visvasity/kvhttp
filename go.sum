@@ -8,9 +8,13 @@ github.com/visvasity/kv v0.0.0-20250507124622-6d2db50b9917 h1:WMMZyKM7JDiEJpZVou
 github.com/visvasity/kv v0.0.0-20250507124622-6d2db50b9917/go.mod h1:CZqPYUOKOBKISPpVXqWdRQJQqxRT3n9//U9PULXfpbY=
 github.com/visvasity/kv v0.0.0-20250508033112-397c38338d68 h1:kIdzttqkI1oMKg5W9GJxMijLuhs23YECNQ+Ym4ZKNvQ=
 github.com/visvasity/kv v0.0.0-20250508033112-397c38338d68/go.mod h1:CZqPYUOKOBKISPpVXqWdRQJQqxRT3n9//U9PULXfpbY=
+github.com/visvasity/kv v0.0.0-20250824163035-09b2b67d839f h1:XcDZpgt0tLcmHA2tW2Wu6+HEiX9HDvaNn73WQjh1Y+I=
+github.com/visvasity/kv v0.0.0-20250824163035-09b2b67d839f/go.mod h1:CZqPYUOKOBKISPpVXqWdRQJQqxRT3n9//U9PULXfpbY=
 github.com/visvasity/kvmemdb v0.0.0-20250422160013-f3aa370fcb6b h1:F6I/pXVWJ93MMfM9cflf/L93zvO8JVRokBmY1+zkfIg=
 github.com/visvasity/kvmemdb v0.0.0-20250422160013-f3aa370fcb6b/go.mod h1:Mjs2rOgIUYXF5rfdrUlBZfvYPW5f9Uu4NqzQ36a3Bbk=
 github.com/visvasity/kvmemdb v0.0.0-20250507225356-026151db4347 h1:oop6SudAqD10XiYbeEqmgagb31v9PyFKTs/Lx8XO2bY=
 github.com/visvasity/kvmemdb v0.0.0-20250507225356-026151db4347/go.mod h1:z9eefhN71vgstMAYx6EFdrN/75ySIq+FZdELr1H4FEk=
+github.com/visvasity/kvmemdb v0.0.0-20250824163232-8b180c2d78ef h1:2Bs8K31912x6LfrFkN+NQT9jJvbNqaoEchvESMx6THc=
+github.com/visvasity/kvmemdb v0.0.0-20250824163232-8b180c2d78ef/go.mod h1:pSBEZ6vZnv5IE0/qFhuj8Kdyd/wlLKqJizWJjibE+eg=
 github.com/visvasity/syncmap v0.0.0-20241218025521-5599e6c230a7 h1:r8HaTmvUhdi4TTwcESTguWUHzujRFyMI/bUvWfSoF8Q=
 github.com/visvasity/syncmap v0.0.0-20241218025521-5599e6c230a7/go.mod h1:SMJL78NBYF7GlGIPYUrV2vdmuIbtxJBBCE7NWT35FMc=

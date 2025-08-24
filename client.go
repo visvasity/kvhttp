@@ -206,40 +206,6 @@ func (tx *Tx) Descend(ctx context.Context, begin, end string, errp *error) iter.
 	}
 }
 
-func (tx *Tx) Scan(ctx context.Context, errp *error) iter.Seq2[string, io.Reader] {
-	return func(yield func(string, io.Reader) bool) {
-		req1 := &api.ScanRequest{Transaction: tx.id, Name: uuid.New().String()}
-		resp1, err := doPost[api.ScanResponse](ctx, tx.db, "/tx/scan", req1)
-		if err != nil {
-			*errp = err
-			return
-		}
-		if len(resp1.Error) != 0 {
-			*errp = string2error(resp1.Error)
-			return
-		}
-
-		for {
-			req2 := &api.NextRequest{Iterator: req1.Name}
-			resp2, err := doPost[api.NextResponse](ctx, tx.db, "/it/next", req2)
-			if err != nil {
-				*errp = err
-				return
-			}
-			if len(resp2.Error) != 0 {
-				*errp = string2error(resp2.Error)
-				return
-			}
-			if len(resp2.Key) == 0 {
-				return // EOF
-			}
-			if !yield(resp2.Key, bytes.NewReader(resp2.Value)) {
-				return
-			}
-		}
-	}
-}
-
 func (tx *Tx) Commit(ctx context.Context) error {
 	req := &api.CommitRequest{Transaction: tx.id}
 	resp, err := doPost[api.CommitResponse](ctx, tx.db, "/tx/commit", req)
@@ -324,40 +290,6 @@ func (snap *Snap) Descend(ctx context.Context, begin, end string, errp *error) i
 			End:      end,
 		}
 		resp1, err := doPost[api.DescendResponse](ctx, snap.db, "/snap/descend", req1)
-		if err != nil {
-			*errp = err
-			return
-		}
-		if len(resp1.Error) != 0 {
-			*errp = string2error(resp1.Error)
-			return
-		}
-
-		for {
-			req2 := &api.NextRequest{Iterator: req1.Name}
-			resp2, err := doPost[api.NextResponse](ctx, snap.db, "/it/next", req2)
-			if err != nil {
-				*errp = err
-				return
-			}
-			if len(resp2.Error) != 0 {
-				*errp = string2error(resp2.Error)
-				return
-			}
-			if len(resp2.Key) == 0 {
-				return // EOF
-			}
-			if !yield(resp2.Key, bytes.NewReader(resp2.Value)) {
-				return
-			}
-		}
-	}
-}
-
-func (snap *Snap) Scan(ctx context.Context, errp *error) iter.Seq2[string, io.Reader] {
-	return func(yield func(string, io.Reader) bool) {
-		req1 := &api.ScanRequest{Snapshot: snap.id, Name: uuid.New().String()}
-		resp1, err := doPost[api.ScanResponse](ctx, snap.db, "/snap/scan", req1)
 		if err != nil {
 			*errp = err
 			return
