@@ -9,6 +9,9 @@ import (
 )
 
 func error2string(err error) string {
+	if errors.Is(err, os.ErrClosed) {
+		return "ErrClosed"
+	}
 	if errors.Is(err, os.ErrInvalid) {
 		return "ErrInvalid"
 	}
@@ -22,6 +25,9 @@ func error2string(err error) string {
 }
 
 func string2error(str string) error {
+	if str == "ErrClosed" {
+		return os.ErrClosed
+	}
 	if str == "ErrInvalid" {
 		return os.ErrInvalid
 	}

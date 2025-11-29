@@ -11,11 +11,13 @@ import (
 	"io"
 	"iter"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -55,7 +57,8 @@ type server struct {
 	// nameMap holds a mapping from client assigned name to an unique, lockable
 	// uuid. Clients refer to iterators, snapshots and txes by their names, which
 	// are assigned unique uuids on the server side.
-	nameMap syncmap.Map[string, *idLock]
+	nameMap   syncmap.Map[string, *idLock]
+	closedMap syncmap.Map[string, time.Time]
 
 	txMap     syncmap.Map[uuid.UUID, kv.Transaction]
 	snapMap   syncmap.Map[uuid.UUID, kv.Snapshot]
@@ -135,13 +138,16 @@ func (s *server) LockCreate(name string) (id uuid.UUID, exists bool) {
 	return n.id, false
 }
 
-func (s *server) LockExisting(name string) (id uuid.UUID, ok bool) {
+func (s *server) LockExisting(name string) (id uuid.UUID, err error) {
 	v, ok := s.nameMap.Load(name)
 	if !ok {
-		return id, false
+		if _, ok := s.closedMap.Load(name); ok {
+			return id, os.ErrClosed
+		}
+		return id, os.ErrNotExist
 	}
 	v.mu.Lock()
-	return v.id, true
+	return v.id, nil
 }
 
 func (s *server) resolveName(name string) (id uuid.UUID, ok bool) {
@@ -153,6 +159,7 @@ func (s *server) resolveName(name string) (id uuid.UUID, ok bool) {
 }
 
 func (s *server) deleteName(name string) {
+	s.closedMap.Store(name, time.Now())
 	s.nameMap.Delete(name)
 }
 
@@ -162,6 +169,7 @@ func (s *server) Unlock(name string, delete bool) {
 		return
 	}
 	if delete {
+		s.closedMap.Store(name, time.Now())
 		s.nameMap.Delete(name)
 	}
 	v.mu.Unlock()
@@ -207,6 +215,7 @@ func httpPostJSONHandler[T1 any, T2 any](fun func(context.Context, *url.URL, *T1
 
 		resp, err := fun(r.Context(), r.URL, req)
 		if err != nil {
+			slog.Debug("kvhttp.Server", "url", r.URL.String(), "request", req, "err", err)
 			if se := new(statusErr); errors.As(err, &se) {
 				http.Error(w, se.Error(), se.code)
 				return
@@ -221,9 +230,11 @@ func httpPostJSONHandler[T1 any, T2 any](fun func(context.Context, *url.URL, *T1
 
 		jsbytes, err := json.Marshal(resp)
 		if err != nil {
+			slog.Debug("kvhttp.Server: json.Marshal", "url", r.URL.String(), "request", req, "response", resp, "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		slog.Debug("kvhttp.Server", "url", r.URL.String(), "request", req, "response", resp)
 		w.Write(jsbytes)
 	})
 }
@@ -251,9 +262,12 @@ func (s *server) newTransaction(ctx context.Context, u *url.URL, req *api.NewTra
 }
 
 func (s *server) set(ctx context.Context, u *url.URL, req *api.SetRequest) (*api.SetResponse, error) {
-	id, ok := s.LockExisting(req.Transaction)
-	if !ok {
-		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	id, err := s.LockExisting(req.Transaction)
+	if err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return &api.SetResponse{Error: error2string(err)}, nil
+		}
+		return nil, &statusErr{err: err, code: http.StatusNotFound}
 	}
 	defer s.Unlock(req.Transaction, false /* delete */)
 
@@ -262,16 +276,19 @@ func (s *server) set(ctx context.Context, u *url.URL, req *api.SetRequest) (*api
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 	}
 
-	if err := tx.Set(ctx, req.Key, bytes.NewReader(req.Value)); err != nil {
+	if err := tx.Set(ctx, string(req.Key), bytes.NewReader(req.Value)); err != nil {
 		return &api.SetResponse{Error: error2string(err)}, nil
 	}
 	return &api.SetResponse{}, nil
 }
 
 func (s *server) del(ctx context.Context, u *url.URL, req *api.DeleteRequest) (*api.DeleteResponse, error) {
-	id, ok := s.LockExisting(req.Transaction)
-	if !ok {
-		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
+	id, err := s.LockExisting(req.Transaction)
+	if err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return &api.DeleteResponse{Error: error2string(err)}, nil
+		}
+		return nil, &statusErr{err: err, code: http.StatusNotFound}
 	}
 	defer s.Unlock(req.Transaction, false /* delete */)
 
@@ -280,15 +297,18 @@ func (s *server) del(ctx context.Context, u *url.URL, req *api.DeleteRequest) (*
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 	}
 
-	if err := tx.Delete(ctx, req.Key); err != nil {
+	if err := tx.Delete(ctx, string(req.Key)); err != nil {
 		return &api.DeleteResponse{Error: error2string(err)}, nil
 	}
 	return &api.DeleteResponse{}, nil
 }
 
 func (s *server) commit(ctx context.Context, u *url.URL, req *api.CommitRequest) (*api.CommitResponse, error) {
-	id, ok := s.LockExisting(req.Transaction)
-	if !ok {
+	id, err := s.LockExisting(req.Transaction)
+	if err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return &api.CommitResponse{Error: error2string(err)}, nil
+		}
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 	}
 	defer s.Unlock(req.Transaction, true /* delete */)
@@ -319,14 +339,19 @@ func (s *server) commit(ctx context.Context, u *url.URL, req *api.CommitRequest)
 }
 
 func (s *server) rollback(ctx context.Context, u *url.URL, req *api.RollbackRequest) (*api.RollbackResponse, error) {
-	id, ok := s.LockExisting(req.Transaction)
-	if !ok {
+	id, err := s.LockExisting(req.Transaction)
+	if err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return &api.RollbackResponse{Error: error2string(err)}, nil
+		}
+		log.Println(1, "not found")
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 	}
 	defer s.Unlock(req.Transaction, true /* delete */)
 
 	tx, ok := s.txMap.Load(id)
 	if !ok {
+		log.Println(2, "not found")
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 	}
 	s.txMap.Delete(id)
@@ -368,8 +393,11 @@ func (s *server) newSnapshot(ctx context.Context, u *url.URL, req *api.NewSnapsh
 }
 
 func (s *server) discard(ctx context.Context, u *url.URL, req *api.DiscardRequest) (*api.DiscardResponse, error) {
-	id, ok := s.LockExisting(req.Snapshot)
-	if !ok {
+	id, err := s.LockExisting(req.Snapshot)
+	if err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return &api.DiscardResponse{Error: error2string(err)}, nil
+		}
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 	}
 	defer s.Unlock(req.Snapshot, true /* delete */)
@@ -408,8 +436,11 @@ func (s *server) get(ctx context.Context, u *url.URL, req *api.GetRequest) (*api
 
 	var getter kv.Getter
 	if len(req.Transaction) != 0 {
-		id, ok := s.LockExisting(req.Transaction)
-		if !ok {
+		id, err := s.LockExisting(req.Transaction)
+		if err != nil {
+			if errors.Is(err, os.ErrClosed) {
+				return &api.GetResponse{Error: error2string(err)}, nil
+			}
 			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 		}
 		defer s.Unlock(req.Transaction, false /* delete */)
@@ -420,8 +451,11 @@ func (s *server) get(ctx context.Context, u *url.URL, req *api.GetRequest) (*api
 		}
 		getter = tx
 	} else {
-		id, ok := s.LockExisting(req.Snapshot)
-		if !ok {
+		id, err := s.LockExisting(req.Snapshot)
+		if err != nil {
+			if errors.Is(err, os.ErrClosed) {
+				return &api.GetResponse{Error: error2string(err)}, nil
+			}
 			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 		}
 		defer s.Unlock(req.Snapshot, false /* delete */)
@@ -433,7 +467,7 @@ func (s *server) get(ctx context.Context, u *url.URL, req *api.GetRequest) (*api
 		getter = snap
 	}
 
-	v, err := getter.Get(ctx, req.Key)
+	v, err := getter.Get(ctx, string(req.Key))
 	if err != nil {
 		return &api.GetResponse{Error: error2string(err)}, nil
 	}
@@ -462,9 +496,12 @@ func (s *server) ascend(ctx context.Context, u *url.URL, req *api.AscendRequest)
 	var rangerID uuid.UUID
 	var rangerItersMap *syncmap.Map[uuid.UUID, []string]
 	if len(req.Transaction) != 0 {
-		id, ok := s.LockExisting(req.Transaction)
-		if !ok {
+		id, err := s.LockExisting(req.Transaction)
+		if err != nil {
 			s.deleteName(req.Name)
+			if errors.Is(err, os.ErrClosed) {
+				return &api.AscendResponse{Error: error2string(err)}, nil
+			}
 			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 		}
 		defer s.Unlock(req.Transaction, false /* delete */)
@@ -478,9 +515,12 @@ func (s *server) ascend(ctx context.Context, u *url.URL, req *api.AscendRequest)
 		rangerID = id
 		rangerItersMap = &s.txItersMap
 	} else {
-		id, ok := s.LockExisting(req.Snapshot)
-		if !ok {
+		id, err := s.LockExisting(req.Snapshot)
+		if err != nil {
 			s.deleteName(req.Name)
+			if errors.Is(err, os.ErrClosed) {
+				return &api.AscendResponse{Error: error2string(err)}, nil
+			}
 			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 		}
 		defer s.Unlock(req.Snapshot, false /* delete */)
@@ -499,7 +539,7 @@ func (s *server) ascend(ctx context.Context, u *url.URL, req *api.AscendRequest)
 	// snapshot's iterators map.
 	itd := new(iterData)
 	itd.ctx, itd.ctxCancel = context.WithCancel(context.Background())
-	itd.iter = ranger.Ascend(ctx, req.Begin, req.End, &itd.err)
+	itd.iter = ranger.Ascend(itd.ctx, string(req.Begin), string(req.End), &itd.err)
 	itd.next, itd.stop = iter.Pull2(itd.iter)
 
 	s.itDataMap.Store(id, itd)
@@ -527,9 +567,12 @@ func (s *server) descend(ctx context.Context, u *url.URL, req *api.DescendReques
 	var rangerID uuid.UUID
 	var rangerItersMap *syncmap.Map[uuid.UUID, []string]
 	if len(req.Transaction) != 0 {
-		id, ok := s.LockExisting(req.Transaction)
-		if !ok {
+		id, err := s.LockExisting(req.Transaction)
+		if err != nil {
 			s.deleteName(req.Name)
+			if errors.Is(err, os.ErrClosed) {
+				return &api.DescendResponse{Error: error2string(err)}, nil
+			}
 			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 		}
 		defer s.Unlock(req.Transaction, false /* delete */)
@@ -543,9 +586,12 @@ func (s *server) descend(ctx context.Context, u *url.URL, req *api.DescendReques
 		rangerID = id
 		rangerItersMap = &s.txItersMap
 	} else {
-		id, ok := s.LockExisting(req.Snapshot)
-		if !ok {
+		id, err := s.LockExisting(req.Snapshot)
+		if err != nil {
 			s.deleteName(req.Name)
+			if errors.Is(err, os.ErrClosed) {
+				return &api.DescendResponse{Error: error2string(err)}, nil
+			}
 			return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 		}
 		defer s.Unlock(req.Snapshot, false /* delete */)
@@ -564,7 +610,7 @@ func (s *server) descend(ctx context.Context, u *url.URL, req *api.DescendReques
 	// snapshot's iterators map.
 	itd := new(iterData)
 	itd.ctx, itd.ctxCancel = context.WithCancel(context.Background())
-	itd.iter = ranger.Descend(ctx, req.Begin, req.End, &itd.err)
+	itd.iter = ranger.Descend(itd.ctx, string(req.Begin), string(req.End), &itd.err)
 	itd.next, itd.stop = iter.Pull2(itd.iter)
 
 	s.itDataMap.Store(id, itd)
@@ -575,8 +621,11 @@ func (s *server) descend(ctx context.Context, u *url.URL, req *api.DescendReques
 }
 
 func (s *server) next(ctx context.Context, u *url.URL, req *api.NextRequest) (*api.NextResponse, error) {
-	id, ok := s.LockExisting(req.Iterator)
-	if !ok {
+	id, err := s.LockExisting(req.Iterator)
+	if err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return &api.NextResponse{Error: error2string(err)}, nil
+		}
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 	}
 	defer s.Unlock(req.Iterator, false /* delete */)
@@ -591,7 +640,7 @@ func (s *server) next(ctx context.Context, u *url.URL, req *api.NextRequest) (*a
 		if err != nil {
 			return &api.NextResponse{Error: error2string(err)}, nil
 		}
-		return &api.NextResponse{Key: key, Value: data}, nil
+		return &api.NextResponse{Key: []byte(key), Value: data}, nil
 	}
 	if itd.err != nil {
 		return &api.NextResponse{Error: error2string(itd.err)}, nil

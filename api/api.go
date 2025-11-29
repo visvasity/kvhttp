@@ -22,7 +22,7 @@ type GetRequest struct {
 	Transaction string
 	Snapshot    string
 
-	Key string
+	Key []byte
 }
 
 type GetResponse struct {
@@ -34,7 +34,7 @@ type GetResponse struct {
 type SetRequest struct {
 	Transaction string
 
-	Key string
+	Key []byte
 
 	Value []byte
 }
@@ -46,7 +46,7 @@ type SetResponse struct {
 type DeleteRequest struct {
 	Transaction string
 
-	Key string
+	Key []byte
 }
 
 type DeleteResponse struct {
@@ -57,9 +57,9 @@ type AscendRequest struct {
 	Transaction string
 	Snapshot    string
 
-	Begin string
+	Begin []byte
 
-	End string
+	End []byte
 
 	Name string
 }
@@ -72,9 +72,9 @@ type DescendRequest struct {
 	Transaction string
 	Snapshot    string
 
-	Begin string
+	Begin []byte
 
-	End string
+	End []byte
 
 	Name string
 }
@@ -101,7 +101,7 @@ type NextRequest struct {
 type NextResponse struct {
 	Error string
 
-	Key string
+	Key []byte
 
 	Value []byte
 }

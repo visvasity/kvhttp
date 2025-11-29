@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 
 	"github.com/google/uuid"
@@ -85,7 +87,7 @@ func (db *DB) NewSnapshot(ctx context.Context) (*Snap, error) {
 }
 
 func (tx *Tx) Get(ctx context.Context, key string) (io.Reader, error) {
-	req := &api.GetRequest{Transaction: tx.id, Key: key}
+	req := &api.GetRequest{Transaction: tx.id, Key: []byte(key)}
 	resp, err := doPost[api.GetResponse](ctx, tx.db, "/tx/get", req)
 	if err != nil {
 		return nil, err
@@ -97,13 +99,16 @@ func (tx *Tx) Get(ctx context.Context, key string) (io.Reader, error) {
 }
 
 func (tx *Tx) Set(ctx context.Context, key string, value io.Reader) error {
+	if value == nil {
+		return os.ErrInvalid
+	}
 	data, err := io.ReadAll(value)
 	if err != nil {
 		return err
 	}
 	req := &api.SetRequest{
 		Transaction: tx.id,
-		Key:         key,
+		Key:         []byte(key),
 		Value:       data,
 	}
 	resp, err := doPost[api.SetResponse](ctx, tx.db, "/tx/set", req)
@@ -117,7 +122,7 @@ func (tx *Tx) Set(ctx context.Context, key string, value io.Reader) error {
 }
 
 func (tx *Tx) Delete(ctx context.Context, key string) error {
-	req := &api.DeleteRequest{Transaction: tx.id, Key: key}
+	req := &api.DeleteRequest{Transaction: tx.id, Key: []byte(key)}
 	resp, err := doPost[api.DeleteResponse](ctx, tx.db, "/tx/delete", req)
 	if err != nil {
 		return err
@@ -133,8 +138,8 @@ func (tx *Tx) Ascend(ctx context.Context, begin, end string, errp *error) iter.S
 		req1 := &api.AscendRequest{
 			Transaction: tx.id,
 			Name:        uuid.New().String(),
-			Begin:       begin,
-			End:         end,
+			Begin:       []byte(begin),
+			End:         []byte(end),
 		}
 		resp1, err := doPost[api.AscendResponse](ctx, tx.db, "/tx/ascend", req1)
 		if err != nil {
@@ -160,7 +165,7 @@ func (tx *Tx) Ascend(ctx context.Context, begin, end string, errp *error) iter.S
 			if len(resp2.Key) == 0 {
 				return // EOF
 			}
-			if !yield(resp2.Key, bytes.NewReader(resp2.Value)) {
+			if !yield(string(resp2.Key), bytes.NewReader(resp2.Value)) {
 				return
 			}
 		}
@@ -172,8 +177,8 @@ func (tx *Tx) Descend(ctx context.Context, begin, end string, errp *error) iter.
 		req1 := &api.DescendRequest{
 			Transaction: tx.id,
 			Name:        uuid.New().String(),
-			Begin:       begin,
-			End:         end,
+			Begin:       []byte(begin),
+			End:         []byte(end),
 		}
 		resp1, err := doPost[api.DescendResponse](ctx, tx.db, "/tx/descend", req1)
 		if err != nil {
@@ -199,7 +204,7 @@ func (tx *Tx) Descend(ctx context.Context, begin, end string, errp *error) iter.
 			if len(resp2.Key) == 0 {
 				return // EOF
 			}
-			if !yield(resp2.Key, bytes.NewReader(resp2.Value)) {
+			if !yield(string(resp2.Key), bytes.NewReader(resp2.Value)) {
 				return
 			}
 		}
@@ -231,7 +236,7 @@ func (tx *Tx) Rollback(ctx context.Context) error {
 }
 
 func (snap *Snap) Get(ctx context.Context, key string) (io.Reader, error) {
-	req := &api.GetRequest{Snapshot: snap.id, Key: key}
+	req := &api.GetRequest{Snapshot: snap.id, Key: []byte(key)}
 	resp, err := doPost[api.GetResponse](ctx, snap.db, "/snap/get", req)
 	if err != nil {
 		return nil, err
@@ -247,8 +252,8 @@ func (snap *Snap) Ascend(ctx context.Context, begin, end string, errp *error) it
 		req1 := &api.AscendRequest{
 			Snapshot: snap.id,
 			Name:     uuid.New().String(),
-			Begin:    begin,
-			End:      end,
+			Begin:    []byte(begin),
+			End:      []byte(end),
 		}
 		resp1, err := doPost[api.AscendResponse](ctx, snap.db, "/snap/ascend", req1)
 		if err != nil {
@@ -274,7 +279,7 @@ func (snap *Snap) Ascend(ctx context.Context, begin, end string, errp *error) it
 			if len(resp2.Key) == 0 {
 				return // EOF
 			}
-			if !yield(resp2.Key, bytes.NewReader(resp2.Value)) {
+			if !yield(string(resp2.Key), bytes.NewReader(resp2.Value)) {
 				return
 			}
 		}
@@ -286,8 +291,8 @@ func (snap *Snap) Descend(ctx context.Context, begin, end string, errp *error) i
 		req1 := &api.DescendRequest{
 			Snapshot: snap.id,
 			Name:     uuid.New().String(),
-			Begin:    begin,
-			End:      end,
+			Begin:    []byte(begin),
+			End:      []byte(end),
 		}
 		resp1, err := doPost[api.DescendResponse](ctx, snap.db, "/snap/descend", req1)
 		if err != nil {
@@ -313,7 +318,7 @@ func (snap *Snap) Descend(ctx context.Context, begin, end string, errp *error) i
 			if len(resp2.Key) == 0 {
 				return // EOF
 			}
-			if !yield(resp2.Key, bytes.NewReader(resp2.Value)) {
+			if !yield(string(resp2.Key), bytes.NewReader(resp2.Value)) {
 				return
 			}
 		}
@@ -353,11 +358,18 @@ func doPost[RESP, REQ any](ctx context.Context, db *DB, subpath string, req *REQ
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		slog.Debug("kvhttp.Client", "url", u.String(), "request", req, "code", resp.StatusCode)
 		return nil, fmt.Errorf("received non-ok http status %d", resp.StatusCode)
 	}
-	response := new(RESP)
-	if err := json.NewDecoder(resp.Body).Decode(response); err != nil {
+	respData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Debug("kvhttp.Client", "url", u.String(), "request", req, "code", resp.StatusCode, "err", err)
 		return nil, err
 	}
+	response := new(RESP)
+	if err := json.Unmarshal(respData, response); err != nil {
+		return nil, err
+	}
+	slog.Debug("kvhttp.Client", "url", u.String(), "request", req, "response", response)
 	return response, nil
 }
