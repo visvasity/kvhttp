@@ -359,6 +359,11 @@ func doPost[RESP, REQ any](ctx context.Context, db *DB, subpath string, req *REQ
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		slog.Debug("kvhttp.Client", "url", u.String(), "request", req, "code", resp.StatusCode)
+		// A 404 identifies an unknown transaction/snapshot/iterator name
+		// (spec §7.1); surface it as os.ErrNotExist so errors.Is works.
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("%s: %w", u.String(), os.ErrNotExist)
+		}
 		return nil, fmt.Errorf("received non-ok http status %d", resp.StatusCode)
 	}
 	respData, err := io.ReadAll(resp.Body)
