@@ -291,6 +291,12 @@ func (s *server) newTransaction(ctx context.Context, u *url.URL, req *api.NewTra
 	defer s.Unlock(req.Name, false /* delete */)
 
 	if exists {
+		// Idempotent retry: if the name already refers to a live transaction, a
+		// prior create (whose response may have been lost) succeeded, so report
+		// success rather than a conflict (spec §8.1).
+		if _, ok := s.txMap.Load(id); ok {
+			return &api.NewTransactionResponse{}, nil
+		}
 		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
 	}
 
@@ -454,6 +460,12 @@ func (s *server) newSnapshot(ctx context.Context, u *url.URL, req *api.NewSnapsh
 	defer s.Unlock(req.Name, false /* delete */)
 
 	if exists {
+		// Idempotent retry: if the name already refers to a live snapshot, a
+		// prior create (whose response may have been lost) succeeded, so report
+		// success rather than a conflict (spec §8.2).
+		if _, ok := s.snapMap.Load(id); ok {
+			return &api.NewSnapshotResponse{}, nil
+		}
 		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
 	}
 
@@ -564,6 +576,13 @@ func (s *server) ascend(ctx context.Context, u *url.URL, req *api.AscendRequest)
 	id, exists := s.LockCreate(req.Name)
 	defer s.Unlock(req.Name, false /* delete */)
 	if exists {
+		// Idempotent retry: if the name already refers to a live iterator, a
+		// prior create (whose response may have been lost) succeeded and the
+		// iterator is still positioned at its start, so report success rather
+		// than a conflict (spec §8.10).
+		if _, ok := s.itDataMap.Load(id); ok {
+			return &api.AscendResponse{}, nil
+		}
 		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
 	}
 
@@ -635,6 +654,13 @@ func (s *server) descend(ctx context.Context, u *url.URL, req *api.DescendReques
 	id, exists := s.LockCreate(req.Name)
 	defer s.Unlock(req.Name, false /* delete */)
 	if exists {
+		// Idempotent retry: if the name already refers to a live iterator, a
+		// prior create (whose response may have been lost) succeeded and the
+		// iterator is still positioned at its start, so report success rather
+		// than a conflict (spec §8.11).
+		if _, ok := s.itDataMap.Load(id); ok {
+			return &api.DescendResponse{}, nil
+		}
 		return nil, &statusErr{err: os.ErrExist, code: http.StatusConflict}
 	}
 
