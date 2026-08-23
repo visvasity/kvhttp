@@ -235,14 +235,14 @@ func httpPostJSONHandler[T1 any, T2 any](fun func(context.Context, *url.URL, *T1
 			return
 		}
 
-		var req *T1
-		if len(data) > 0 {
-			req = new(T1)
-			if err := json.Unmarshal(data, req); err != nil {
-				log.Printf("bad request payload: %v", err)
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
+		// Always decode into a non-nil request. Every endpoint requires a JSON
+		// object body, so an empty or malformed body is a bad request rather
+		// than a nil request that handlers would dereference (spec §2.2, §7.1).
+		req := new(T1)
+		if err := json.Unmarshal(data, req); err != nil {
+			log.Printf("bad request payload: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 
 		resp, err := fun(r.Context(), r.URL, req)
