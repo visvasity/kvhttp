@@ -31,6 +31,25 @@ type idLock struct {
 	mu sync.Mutex
 }
 
+// txOutcome records the terminal outcome of a transaction so that retried
+// commit/rollback requests can learn the decided result (spec §8.9).
+type txOutcome int
+
+const (
+	// outcomeNone is used for non-transaction names (snapshots, iterators) and
+	// for transactions whose outcome is not tracked.
+	outcomeNone txOutcome = iota
+	outcomeCommitted
+	outcomeRolledBack
+)
+
+// closedInfo records when a name was retired and, for transactions, its
+// terminal outcome.
+type closedInfo struct {
+	when    time.Time
+	outcome txOutcome
+}
+
 type iterData struct {
 	ctx       context.Context
 	ctxCancel context.CancelFunc
@@ -58,7 +77,7 @@ type server struct {
 	// uuid. Clients refer to iterators, snapshots and txes by their names, which
 	// are assigned unique uuids on the server side.
 	nameMap   syncmap.Map[string, *idLock]
-	closedMap syncmap.Map[string, time.Time]
+	closedMap syncmap.Map[string, closedInfo]
 
 	txMap     syncmap.Map[uuid.UUID, kv.Transaction]
 	snapMap   syncmap.Map[uuid.UUID, kv.Snapshot]
@@ -159,8 +178,21 @@ func (s *server) resolveName(name string) (id uuid.UUID, ok bool) {
 }
 
 func (s *server) deleteName(name string) {
-	s.closedMap.Store(name, time.Now())
+	s.closedMap.Store(name, closedInfo{when: time.Now(), outcome: outcomeNone})
 	s.nameMap.Delete(name)
+}
+
+// unlockTx marks a transaction name closed with the given terminal outcome and
+// unlocks it, so that later requests can distinguish a committed transaction
+// from a rolled-back one (spec §8.9).
+func (s *server) unlockTx(name string, outcome txOutcome) {
+	v, ok := s.nameMap.Load(name)
+	if !ok {
+		return
+	}
+	s.closedMap.Store(name, closedInfo{when: time.Now(), outcome: outcome})
+	s.nameMap.Delete(name)
+	v.mu.Unlock()
 }
 
 func (s *server) Unlock(name string, delete bool) {
@@ -169,7 +201,7 @@ func (s *server) Unlock(name string, delete bool) {
 		return
 	}
 	if delete {
-		s.closedMap.Store(name, time.Now())
+		s.closedMap.Store(name, closedInfo{when: time.Now(), outcome: outcomeNone})
 		s.nameMap.Delete(name)
 	}
 	v.mu.Unlock()
@@ -311,7 +343,12 @@ func (s *server) commit(ctx context.Context, u *url.URL, req *api.CommitRequest)
 		}
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 	}
-	defer s.Unlock(req.Transaction, true /* delete */)
+
+	// Record the transaction's terminal outcome so that retried commits can
+	// learn the decided result (spec §8.9). A commit that fails leaves the
+	// transaction rolled back, so default to that until commit succeeds.
+	outcome := outcomeRolledBack
+	defer func() { s.unlockTx(req.Transaction, outcome) }()
 
 	tx, ok := s.txMap.Load(id)
 	if !ok {
@@ -335,6 +372,7 @@ func (s *server) commit(ctx context.Context, u *url.URL, req *api.CommitRequest)
 	if err := tx.Commit(ctx); err != nil {
 		return &api.CommitResponse{Error: error2string(err)}, nil
 	}
+	outcome = outcomeCommitted
 	return &api.CommitResponse{}, nil
 }
 
@@ -347,7 +385,7 @@ func (s *server) rollback(ctx context.Context, u *url.URL, req *api.RollbackRequ
 		log.Println(1, "not found")
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 	}
-	defer s.Unlock(req.Transaction, true /* delete */)
+	defer s.unlockTx(req.Transaction, outcomeRolledBack)
 
 	tx, ok := s.txMap.Load(id)
 	if !ok {
