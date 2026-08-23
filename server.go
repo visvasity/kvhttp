@@ -166,6 +166,17 @@ func (s *server) LockExisting(name string) (id uuid.UUID, err error) {
 		return id, os.ErrNotExist
 	}
 	v.mu.Lock()
+	// The name may have been closed (committed/rolled back/discarded), or
+	// reused, by a concurrent request while we waited for the lock. Re-check
+	// liveness and report the terminal state instead of proceeding with a stale
+	// reference (spec §7.3).
+	if cur, ok := s.nameMap.Load(name); !ok || cur != v {
+		v.mu.Unlock()
+		if _, ok := s.closedMap.Load(name); ok {
+			return id, os.ErrClosed
+		}
+		return id, os.ErrNotExist
+	}
 	return v.id, nil
 }
 
