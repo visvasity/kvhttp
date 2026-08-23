@@ -335,10 +335,31 @@ func (s *server) del(ctx context.Context, u *url.URL, req *api.DeleteRequest) (*
 	return &api.DeleteResponse{}, nil
 }
 
+// commitOutcomeResponse maps a transaction's recorded terminal outcome to the
+// response for a retried commit (spec §8.9): an already-committed transaction
+// reports success, so a lost commit response never surfaces as failure; a
+// rolled-back transaction reports ErrClosed. Returns ok=false when no terminal
+// outcome has been recorded for the name.
+func (s *server) commitOutcomeResponse(name string) (*api.CommitResponse, bool) {
+	ci, ok := s.closedMap.Load(name)
+	if !ok {
+		return nil, false
+	}
+	if ci.outcome == outcomeCommitted {
+		return &api.CommitResponse{}, true
+	}
+	return &api.CommitResponse{Error: error2string(os.ErrClosed)}, true
+}
+
 func (s *server) commit(ctx context.Context, u *url.URL, req *api.CommitRequest) (*api.CommitResponse, error) {
 	id, err := s.LockExisting(req.Transaction)
 	if err != nil {
+		// A retried commit of a terminated transaction reports its recorded
+		// outcome: committed => success, rolled back => ErrClosed (spec §8.9).
 		if errors.Is(err, os.ErrClosed) {
+			if resp, ok := s.commitOutcomeResponse(req.Transaction); ok {
+				return resp, nil
+			}
 			return &api.CommitResponse{Error: error2string(err)}, nil
 		}
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
@@ -352,6 +373,11 @@ func (s *server) commit(ctx context.Context, u *url.URL, req *api.CommitRequest)
 
 	tx, ok := s.txMap.Load(id)
 	if !ok {
+		// A concurrent commit may have terminated the transaction after we
+		// acquired the name lock; report its recorded outcome (spec §8.9).
+		if resp, ok := s.commitOutcomeResponse(req.Transaction); ok {
+			return resp, nil
+		}
 		return nil, &statusErr{err: os.ErrNotExist, code: http.StatusNotFound}
 	}
 	s.txMap.Delete(id)
