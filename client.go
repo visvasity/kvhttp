@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -14,11 +15,31 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/visvasity/kvhttp/api"
 )
+
+// commit retry-to-confirm tuning (spec §8.9). An indeterminate commit failure
+// (network error, timeout, 5xx) is retried with capped exponential backoff
+// until the caller's context expires or a definite outcome is observed.
+const (
+	commitRetryBaseDelay = 50 * time.Millisecond
+	commitRetryMaxDelay  = 5 * time.Second
+)
+
+// httpStatusError reports a non-OK HTTP status from the server, preserving the
+// status code so callers (e.g. commit retry) can distinguish transient 5xx
+// failures from deterministic 4xx ones.
+type httpStatusError struct {
+	code int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("received non-ok http status %d", e.code)
+}
 
 type DB struct {
 	dbURL url.URL
@@ -213,14 +234,71 @@ func (tx *Tx) Descend(ctx context.Context, begin, end string, errp *error) iter.
 
 func (tx *Tx) Commit(ctx context.Context) error {
 	req := &api.CommitRequest{Transaction: tx.id}
-	resp, err := doPost[api.CommitResponse](ctx, tx.db, "/tx/commit", req)
-	if err != nil {
-		return err
+	// Retry-to-confirm (spec §8.9): an indeterminate failure leaves the commit
+	// in doubt, so re-send until the server reports a definite outcome. The
+	// server makes a replayed commit idempotent -- a committed transaction
+	// reports success, a rolled-back one reports ErrClosed -- so retrying never
+	// double-applies or falsely reports failure.
+	for attempt := 0; ; attempt++ {
+		resp, err := doPost[api.CommitResponse](ctx, tx.db, "/tx/commit", req)
+		if err == nil {
+			if len(resp.Error) != 0 {
+				return string2error(resp.Error)
+			}
+			return nil
+		}
+		if !isRetryableCommitErr(err) {
+			return err
+		}
+		if werr := waitBackoff(ctx, attempt); werr != nil {
+			// The context expired before we could confirm the outcome; report
+			// the last transport error together with the context error.
+			return errors.Join(err, werr)
+		}
 	}
-	if len(resp.Error) != 0 {
-		return string2error(resp.Error)
+}
+
+// isRetryableCommitErr reports whether a commit failure is indeterminate and so
+// should be retried to confirm the outcome (spec §8.9). Well-formed responses
+// are handled by the caller; here only transport failures are seen. A 404
+// (os.ErrNotExist) and other 4xx statuses are deterministic and not retried;
+// 5xx and network/timeout errors are transient.
+func isRetryableCommitErr(err error) bool {
+	if err == nil {
+		return false
 	}
-	return nil
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	var se *httpStatusError
+	if errors.As(err, &se) {
+		return se.code >= 500
+	}
+	return true
+}
+
+// waitBackoff sleeps for the attempt's backoff delay, returning the context
+// error if it is cancelled or expires first.
+func waitBackoff(ctx context.Context, attempt int) error {
+	t := time.NewTimer(backoffDelay(attempt))
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+func backoffDelay(attempt int) time.Duration {
+	if attempt < 0 || attempt > 20 {
+		return commitRetryMaxDelay
+	}
+	d := commitRetryBaseDelay << uint(attempt)
+	if d <= 0 || d > commitRetryMaxDelay {
+		return commitRetryMaxDelay
+	}
+	return d
 }
 
 func (tx *Tx) Rollback(ctx context.Context) error {
@@ -364,7 +442,7 @@ func doPost[RESP, REQ any](ctx context.Context, db *DB, subpath string, req *REQ
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("%s: %w", u.String(), os.ErrNotExist)
 		}
-		return nil, fmt.Errorf("received non-ok http status %d", resp.StatusCode)
+		return nil, &httpStatusError{code: resp.StatusCode}
 	}
 	respData, err := io.ReadAll(resp.Body)
 	if err != nil {
