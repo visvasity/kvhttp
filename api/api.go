@@ -83,17 +83,6 @@ type DescendResponse struct {
 	Error string
 }
 
-type ScanRequest struct {
-	Transaction string
-	Snapshot    string
-
-	Name string
-}
-
-type ScanResponse struct {
-	Error string
-}
-
 type NextRequest struct {
 	Iterator string
 }
